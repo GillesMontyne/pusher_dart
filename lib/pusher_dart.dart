@@ -2,6 +2,7 @@ library pusher_dart;
 
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:http/http.dart' as http;
 import 'package:meta/meta.dart';
@@ -32,30 +33,40 @@ class Channel with _EventEmitter {
 
   bool trigger(String eventName, Object data) {
     try {
-      _connection.webSocketChannel.sink
-          .add(jsonEncode({'event': eventName, 'data': data}));
+      _connection.webSocketChannel.sink.add(jsonEncode({
+        'event': eventName,
+        'data': data,
+      }));
       return true;
     } catch (e) {
       return false;
     }
   }
 
-  Future<bool> connect() async {
+  Future<bool> connect(Function(dynamic) onError) async {
     String auth;
     dynamic channelData;
 
     if (name.startsWith('private-') || name.startsWith('presence-')) {
-      Map<dynamic, dynamic> data = await _connection.authenticate(name);
-      channelData = data['channel_data'];
-      auth = data['auth'];
+      try {
+        Map<dynamic, dynamic> data = await _connection.authenticate(name);
+        channelData = data['channel_data'];
+        auth = data['auth'];
+      } catch (e) {
+        onError(e);
+      }
     }
-    return trigger('pusher:subscribe',
-        {'channel': name, 'auth': auth, 'channel_data': channelData});
+
+    return trigger('pusher:subscribe', {
+      'channel': name,
+      'auth': auth,
+      'channel_data': channelData,
+    });
   }
 }
 
 mixin _EventEmitter {
-  final Map<String, Set<Function(Object data)>> _listeners = {};
+  static final Map<String, Set<Function(Object data)>> _listeners = {};
 
   void bind(String eventName, Function(Object data) callback) {
     if (_listeners[eventName] == null) {
@@ -83,10 +94,11 @@ class Connection with _EventEmitter {
   String apiKey;
   PusherOptions options;
   int _retryIn = 1;
-  IOWebSocketChannel webSocketChannel;
+  WebSocketChannel webSocketChannel;
   final Map<String, Channel> channels = {};
+  Function(dynamic) onError;
 
-  Connection(this.apiKey, this.options) {
+  Connection(this.apiKey, this.options, this.onError) {
     _connect();
   }
 
@@ -94,11 +106,20 @@ class Connection with _EventEmitter {
     try {
       state = 'connecting';
       _broadcast('connecting');
-      webSocketChannel = IOWebSocketChannel.connect(
-          'wss://ws-${options
-              .cluster}.pusher.com:443/app/$apiKey?protocol=5&client=dart-libPusher&version=0.1.0');
-      webSocketChannel.stream.listen(_handleMessage);
+
+       webSocketChannel = IOWebSocketChannel.connect(
+        'ws://${options.cluster}/app/$apiKey?protocol=7&client=js&version=4.3.1&flash=false',
+      );
+
+      webSocketChannel.stream.listen(
+        _handleMessage,
+        onError: (error) {
+          onError(PusherConnectionException());
+        },
+        cancelOnError: true,
+      );
     } catch (e) {
+      onError(PusherConnectionException());
       // Give up if we have to tray again after an hour
       if (_retryIn > 3600) return;
       _retryIn++;
@@ -107,24 +128,32 @@ class Connection with _EventEmitter {
   }
 
   Future<Map<dynamic, dynamic>> authenticate(String channelName) async {
-    if (socketId == null)
+    if (socketId == null) {
       throw WebSocketChannelException(
-          'Pusher has not yet established connection');
-    final response = await http.post(options.authEndpoint,
-        headers: options.auth.headers,
-        body: jsonEncode(
-            {'channel_name': channelName, 'socket_id': socketId,}));
-    if (response.statusCode == 200) {
-      return jsonDecode(response.body);
+        'Pusher has not yet established connection',
+      );
     }
-    throw response;
+    try {
+      final response = await http.post(options.authEndpoint,
+          headers: options.auth.headers,
+          body: jsonEncode({
+            'channel_name': channelName,
+            'socket_id': socketId,
+          }));
+      if (response.statusCode != 200) {
+        throw NotAuthorizedException();
+      }
+      return jsonDecode(response.body);
+    } catch (e) {
+      throw NotAuthorizedException();
+    }
   }
 
   _handleMessage(Object message) {
     if (Pusher.log != null) Pusher.log(message);
     final json = Map<String, Object>.from(jsonDecode(message));
     final String eventName = json['event'];
-    final data = json['data'];
+    final data = json['data'] ?? {};
     _broadcast(eventName, data);
     switch (eventName) {
       case 'pusher:connection_established':
@@ -158,14 +187,14 @@ class Connection with _EventEmitter {
     final channel = Channel(channelName, this, data);
     channels[channelName] = channel;
     if (state == 'connected') {
-      channel.connect();
+      channel.connect(this.onError);
     }
     return channel;
   }
 
   _subscribeAll() {
     channels.forEach((channelName, channel) {
-      channel.connect();
+      channel.connect(this.onError);
     });
   }
 
@@ -196,11 +225,10 @@ class Pusher with _EventEmitter {
   static Function log = (Object message) {
     print('Pusher: $message');
   };
-
   Connection _connection;
 
-  Pusher(String apiKey, PusherOptions options) {
-    _connection = Connection(apiKey, options);
+  Pusher(String apiKey, PusherOptions options, Function(dynamic) onError) {
+    _connection = Connection(apiKey, options, onError);
   }
 
   void disconnect() {
@@ -220,3 +248,28 @@ class Pusher with _EventEmitter {
   }
 }
 
+class PusherConnectionException implements Exception {
+  final message;
+
+  PusherConnectionException({
+    this.message = "Failed to connect to pusher.",
+  });
+
+  @override
+  String toString() {
+    return message;
+  }
+}
+
+class NotAuthorizedException implements Exception {
+  final message;
+
+  NotAuthorizedException({
+    this.message = "You are not authorized to access this channel.",
+  });
+
+  @override
+  String toString() {
+    return message;
+  }
+}
